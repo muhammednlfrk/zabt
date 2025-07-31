@@ -2,7 +2,7 @@
 # Set default behavior to:
 #   automatically normalize line endings on check-in
 ###############################################################################
-*text=auto
+* text=auto
 
 ###############################################################################
 # Set file behavior to:
@@ -26,13 +26,7 @@
 *.txt       text
 *.xlf       text
 *.xml       text
-
-###############################################################################
-# Set file behavior to:
-#   treat as text
-#   normalize to Windows-style line endings on check-in
-###############################################################################
-*.sln        text       eol=lf
+*.sln       text
 
 ###############################################################################
 # Set file behavior to:
@@ -47,6 +41,6 @@
 ###############################################################################
 *.snk       binary
 
-*.jpg  	binary
-*.png 	binary
-*.gif 	binary
+*.jpg   binary
+*.png   binary
+*.gif   binary

@@ -1,5 +1,6 @@
 using System;
 using System.Buffers.Binary;
+using Zabt.Core.Hashing;
 
 namespace Zabt.Core
 {
@@ -7,8 +8,17 @@ namespace Zabt.Core
     /// Represents an immutable Write-Ahead Log (WAL) entry that stores transactional data
     /// in a structured binary format for durability and recovery purposes.
     /// </summary>
-    public readonly struct WalEntry : IComparable, IComparable<WalEntry>, IEquatable<WalEntry>, IFormattable
+    public readonly struct WalEntry :
+        IComparable,
+        IComparable<WalEntry>,
+        IEquatable<WalEntry>,
+        IFormattable
     {
+        private const byte CHECKPOINT_MARKER = 0x09; // 1001
+        private const int CHECKPOINT_LENGTH = 34;
+        private const uint CHECKPOINT_MAGIC = 0x43484543; // 'CHEC' in ASCII hex
+        private const byte CHECKPOINT_VERSION = 0X01;
+
         /// <summary>
         /// The binary data of the entry stored in this byte array with the following structure:
         /// <para>
@@ -27,62 +37,6 @@ namespace Zabt.Core
         private readonly byte[] _entry;
 
         /// <summary>
-        /// Initializes a new instance of the <see cref="WalEntry"/> struct with the specified parameters.
-        /// </summary>
-        /// <param name="isCommitted">Indicates whether the operation is committed.</param>
-        /// <param name="entryId">The unique identifier of the entry.</param>
-        /// <param name="timestampTicks">The timestamp ticks when the entry was created (will be stored as UTC).</param>
-        /// <param name="transactionId">The transaction identifier associated with this entry.</param>
-        /// <param name="payload">The payload data for the entry.</param>
-        /// <param name="checksum">The checksum for data integrity verification.</param>
-        /// <exception cref="ArgumentException">Thrown when entryId is empty or transactionId is empty.</exception>
-        /// <exception cref="ArgumentNullException">Thrown when payload or checksum is null.</exception>
-        /// <exception cref="ArgumentException">Thrown when checksum length is not exactly 4 bytes.</exception>
-        public WalEntry(
-            bool isCommitted,
-            Guid entryId,
-            long timestampTicks,
-            Guid transactionId,
-            byte[] payload,
-            byte[] checksum)
-        {
-            if (entryId == Guid.Empty)
-                throw new ArgumentException("Entry ID cannot be empty.", nameof(entryId));
-
-            if (transactionId == Guid.Empty)
-                throw new ArgumentException("Transaction ID cannot be empty.", nameof(transactionId));
-
-            if (payload == null)
-                throw new ArgumentNullException(nameof(payload));
-
-            if (checksum == null)
-                throw new ArgumentNullException(nameof(checksum));
-
-            if (checksum.Length != 4)
-                throw new ArgumentException("Checksum must be exactly 4 bytes.", nameof(checksum));
-
-            _entry = new byte[45 + payload.Length];
-
-            // IsCommitted (1 byte at offset 0)
-            _entry[0] = isCommitted ? (byte)1 : (byte)0;
-
-            // EntryId (16 bytes at offset 1-16)
-            entryId.TryWriteBytes(_entry.AsSpan(1, 16));
-
-            // TimestampTicks (8 bytes at offset 18-25, stored as big-endian)
-            BinaryPrimitives.WriteUInt64BigEndian(_entry.AsSpan(18, 8), (ulong)timestampTicks);
-
-            // TransactionId (16 bytes at offset 26-33)
-            transactionId.TryWriteBytes(_entry.AsSpan(26, 16));
-
-            // Payload (variable length at offset 34 to end-4)
-            payload.AsSpan().CopyTo(_entry.AsSpan(34, payload.Length));
-
-            // Checksum (4 bytes at the end)
-            checksum.AsSpan().CopyTo(_entry.AsSpan(_entry.Length - 4, 4));
-        }
-
-        /// <summary>
         /// Initializes a new instance of the <see cref="WalEntry"/> struct from a byte array representation.
         /// </summary>
         /// <param name="data">The byte array containing the complete WAL entry data.</param>
@@ -93,32 +47,68 @@ namespace Zabt.Core
             if (data == null)
                 throw new ArgumentNullException(nameof(data));
 
-            if (data.Length < 45)
-                throw new ArgumentException("Data array is too short to contain a valid WAL entry.", nameof(data));
+            // Check minimum size based on entry type
+            // Checkpoint entries: minimum 34 bytes, Regular entries: minimum 45 bytes
+            bool isCheckpoint = data.Length >= 1 && data[0] == CHECKPOINT_MARKER;
+            int minimumSize = isCheckpoint ? CHECKPOINT_LENGTH : 45;
+            if (data.Length < minimumSize)
+            {
+                string entryType = isCheckpoint ? "checkpoint" : "regular WAL";
+                throw new ArgumentException(
+                    message: $"Data array is too short to contain a valid {entryType} entry (expected at least {minimumSize} bytes, got {data.Length}).",
+                    paramName: nameof(data));
+            }
 
             // Create a defensive copy to ensure immutability
             _entry = new byte[data.Length];
             data.CopyTo(_entry, 0);
         }
 
+        #region Properties
+
+        /// <summary>
+        /// Gets a value indicating whether this entry is a checkpoint entry.
+        /// Checkpoint entries are special markers used for recovery operations and have a fixed length of 34 bytes.
+        /// </summary>
+        public bool IsCheckpoint => _entry.Length == CHECKPOINT_LENGTH && _entry[0] == CHECKPOINT_MARKER;
+
         /// <summary>
         /// Gets a value indicating whether the operation is committed or not.
+        /// For checkpoint entries, this will always return false.
         /// </summary>
-        public bool IsCommitted => _entry[0] != 0;
+        public bool IsCommitted => !IsCheckpoint && _entry[0] != 0;
 
         /// <summary>
         /// Gets the unique identifier of the entry.
+        /// For checkpoint entries, this returns the checkpoint ID.
         /// </summary>
-        public Guid EntryId => new Guid(_entry.AsSpan(1, 16));
+        public Guid EntryId
+        {
+            get
+            {
+                if (IsCheckpoint)
+                {
+                    if (_entry.Length < 18)
+                        return Guid.Empty;
+
+                    return new Guid(_entry.AsSpan(2, 16));
+                }
+                return new Guid(_entry.AsSpan(1, 16));
+            }
+        }
 
         /// <summary>
-        /// Gets the timestamp when the entry was created as a UTC DateTimeOffset.
-        /// The timestamp is stored internally as ticks in big-endian format.
+        /// Gets the timestamp when the entry was created as a UTC DateTimeOffset. The
+        /// timestamp is stored internally as ticks in big-endian format. For checkpoint
+        /// entries, this returns stored internally as ticks in big-endian format for
+        /// checkopint.
         /// </summary>
         public DateTimeOffset Timestamp
         {
             get
             {
+                // The timestamp of the checksum is also in the _entry.AsSpan(18, 8)
+                // (big-endian). If it changes, you have to update this section.
                 ulong timestampTicks = BinaryPrimitives.ReadUInt64BigEndian(_entry.AsSpan(18, 8));
                 return new DateTimeOffset((long)timestampTicks, TimeSpan.Zero);
             }
@@ -126,20 +116,58 @@ namespace Zabt.Core
 
         /// <summary>
         /// Gets the transaction identifier associated with the current WAL entry.
+        /// For checkpoint entries, this returns Guid.Empty.
         /// </summary>
-        public Guid TransactionId => new Guid(_entry.AsSpan(26, 16));
+        public Guid TransactionId
+        {
+            get
+            {
+                if (IsCheckpoint)
+                    return Guid.Empty;
+
+                return new Guid(_entry.AsSpan(26, 16));
+            }
+        }
 
         /// <summary>
         /// Gets the payload data of the entry containing operation details, entity type, and other relevant information.
+        /// For checkpoint entries, this returns an empty span.
         /// </summary>
-        public ReadOnlySpan<byte> Payload => _entry.AsSpan(34, _entry.Length - 38);
+        public ReadOnlySpan<byte> Payload
+        {
+            get
+            {
+                if (IsCheckpoint)
+                    return ReadOnlySpan<byte>.Empty;
+
+                return _entry.AsSpan(34, _entry.Length - 38);
+            }
+        }
 
         /// <summary>
         /// Gets the checksum of the entry (32-bit) used for data integrity verification. CRC32 by default.
+        /// For checkpoint entries, this returns the checksum of the checkpoint as span.
         /// </summary>
-        public ReadOnlySpan<byte> Checksum => _entry.AsSpan(_entry.Length - 4, 4);
+        public ReadOnlySpan<byte> Checksum
+        {
+            get
+            {
+                if (IsCheckpoint)
+                    return _entry.AsSpan(30, 4);
 
-        #region AsSpan Methods
+                return _entry.AsSpan(_entry.Length - 4, 4);
+            }
+        }
+
+        /// <summary>
+        /// Gets the size of the WAL entry in bytes.
+        /// </summary>
+        /// <returns>The total size of the entry in bytes.</returns>
+        public int Size => _entry.Length;
+
+        #endregion
+
+        #region Public Methods
 
         /// <summary>
         /// Gets the entire WAL entry as a ReadOnlySpan of bytes.
@@ -151,74 +179,200 @@ namespace Zabt.Core
         }
 
         /// <summary>
-        /// Gets the header portion of the WAL entry (everything except payload and checksum).
+        /// Converts the WAL entry to a byte array.
         /// </summary>
-        /// <returns>A ReadOnlySpan representing the header data (34 bytes).</returns>
-        public ReadOnlySpan<byte> GetHeaderSpan()
+        /// <returns>A new byte array containing a copy of the complete WAL entry data.</returns>
+        public byte[] ToArray()
         {
-            return _entry.AsSpan(0, 34);
+            return _entry;
         }
 
         /// <summary>
-        /// Gets the committed flag as a ReadOnlySpan of bytes.
+        /// Validates the integrity of the entry (works for both regular entries and checkpoints).
         /// </summary>
-        /// <returns>A ReadOnlySpan representing the committed flag (1 byte).</returns>
-        public ReadOnlySpan<byte> GetCommittedFlagSpan()
+        /// <returns>True if the entry is valid and not corrupted; otherwise, false.</returns>
+        public bool IsValid()
         {
-            return _entry.AsSpan(0, 1);
+            return IsCheckpoint ? IsValidCheckpoint() : IsValidEntry();
         }
 
         /// <summary>
-        /// Gets the entry ID as a ReadOnlySpan of bytes.
+        /// Validates the integrity of a regular WAL entry using CRC32 checksum verification.
         /// </summary>
-        /// <returns>A ReadOnlySpan representing the entry ID (16 bytes).</returns>
-        public ReadOnlySpan<byte> GetEntryIdSpan()
+        /// <returns>True if the entry is valid and not corrupted; otherwise, false.</returns>
+        public bool IsValidEntry()
         {
-            return _entry.AsSpan(1, 16);
+            if (IsCheckpoint)
+                return IsValidCheckpoint();
+
+            if (_entry.Length < 45)
+                return false;
+
+            try
+            {
+                // Calculate CRC32 over the entry data excluding the last 4 bytes (checksum itself)
+                uint calculatedCrc = CRC32.CreateHash(_entry.AsSpan(0, _entry.Length - 4));
+
+                // Read the stored checksum from the last 4 bytes
+                uint storedCrc = BinaryPrimitives.ReadUInt32BigEndian(_entry.AsSpan(_entry.Length - 4, 4));
+
+                return calculatedCrc == storedCrc;
+            }
+            catch
+            {
+                return false; // Any exception means corruption or invalid format
+            }
         }
 
         /// <summary>
-        /// Gets the timestamp as a ReadOnlySpan of bytes in big-endian format.
+        /// Validates the integrity of a checkpoint entry.
         /// </summary>
-        /// <returns>A ReadOnlySpan representing the timestamp (8 bytes).</returns>
-        public ReadOnlySpan<byte> GetTimestampSpan()
+        /// <returns>True if the checkpoint is valid and not corrupted; otherwise, false.</returns>
+        public bool IsValidCheckpoint()
         {
-            return _entry.AsSpan(18, 8);
+            if (!IsCheckpoint || _entry.Length < 34)
+                return false;
+
+            try
+            {
+                // Check version compatibility
+                byte version = _entry[1];
+                if (version != CHECKPOINT_VERSION)
+                    return false; // Unsupported version
+
+                // Verify magic number
+                uint magic = BinaryPrimitives.ReadUInt32BigEndian(_entry.AsSpan(26, 4));
+                if (magic != CHECKPOINT_MAGIC)
+                    return false;
+
+                // Verify CRC32 checksum
+                uint storedCrc = BinaryPrimitives.ReadUInt32BigEndian(_entry.AsSpan(30, 4));
+                uint calculatedCrc = CRC32.CreateHash(_entry.AsSpan(0, 30));
+
+                return storedCrc == calculatedCrc;
+            }
+            catch
+            {
+                return false; // Any exception means corruption
+            }
+        }
+
+        #endregion
+
+        #region Factory Methods
+
+        /// <summary>
+        /// Creates a new WAL (Write-Ahead Log) entry with a CRC32 checksum for data integrity verification.
+        /// </summary>
+        /// <param name="isCommitted">Indicates whether the entry represents a committed transaction.</param>
+        /// <param name="entryId">The unique identifier for this WAL entry. Cannot be empty.</param>
+        /// <param name="timestampTicks">The timestamp in ticks when the entry was created, stored as big-endian.</param>
+        /// <param name="transactionId">The unique identifier for the transaction this entry belongs to. Cannot be empty.</param>
+        /// <param name="payload">The actual data payload for this entry. Cannot be null.</param>
+        /// <returns>A new <see cref="WalEntry"/> instance with the specified data and calculated CRC32 checksum.</returns>
+        /// <exception cref="ArgumentException">Thrown when <paramref name="entryId"/> or <paramref name="transactionId"/> is empty.</exception>
+        /// <exception cref="ArgumentNullException">Thrown when <paramref name="payload"/> is null.</exception>
+        /// <exception cref="InvalidOperationException">Thrown when writing GUID bytes to the buffer fails.</exception>
+        /// <remarks>
+        /// The entry is serialized into a binary format with the following structure:
+        /// - Byte 0: IsCommitted flag (0x00 or 0x01)
+        /// - Bytes 1-16: EntryId (16 bytes)
+        /// - Bytes 17-24: TimestampTicks (8 bytes, big-endian)
+        /// - Bytes 25-40: TransactionId (16 bytes)
+        /// - Bytes 41 to end-4: Payload (variable length)
+        /// - Last 4 bytes: CRC32 checksum (big-endian)
+        /// </remarks>
+        public static WalEntry CreateEntryWithCRC32Checksum(
+            bool isCommitted,
+            Guid entryId,
+            long timestampTicks,
+            Guid transactionId,
+            byte[] payload)
+        {
+            if (entryId == Guid.Empty)
+                throw new ArgumentException("Entry ID cannot be empty.", nameof(entryId));
+
+            if (transactionId == Guid.Empty)
+                throw new ArgumentException("Transaction ID cannot be empty.", nameof(transactionId));
+
+            if (payload == null)
+                throw new ArgumentNullException(nameof(payload));
+
+            byte[] buffer = new byte[45 + payload.Length];
+            int offset = 0;
+
+            // IsCommitted (1 byte at offset 0)
+            buffer[offset++] = (byte)(isCommitted ? 0x01 : 0x00);
+
+            // EntryId (16 bytes at offset 1-17)
+            bool success = entryId.TryWriteBytes(buffer.AsSpan(offset, 16));
+            if (!success) throw new InvalidOperationException("Failed to write entry ID bytes to the buffer.");
+            offset += 16;
+
+            // TimestampTicks (8 bytes at offset 18-25, stored as big-endian)
+            BinaryPrimitives.WriteUInt64BigEndian(buffer.AsSpan(offset, 8), (ulong)timestampTicks);
+            offset += 8;
+
+            // TransactionId (16 bytes at offset 26-33)
+            success = transactionId.TryWriteBytes(buffer.AsSpan(offset, 16));
+            if (!success) throw new InvalidOperationException("Failed to write transaction ID bytes to the buffer.");
+            offset += 16;
+
+            // Payload (variable length at offset 34 to end-4)
+            payload.AsSpan().CopyTo(buffer.AsSpan(offset, payload.Length));
+            offset += payload.Length;
+
+            // Calculate CRC32 checksum of the entry data (excluding the checksum itself)
+            uint crc32 = CRC32.CreateHash(buffer.AsSpan(0, offset));
+
+            // Write the checksum to the last 4 bytes of the buffer (big-endian)
+            BinaryPrimitives.WriteUInt32BigEndian(buffer.AsSpan(offset, 4), crc32);
+
+            return new WalEntry(buffer);
         }
 
         /// <summary>
-        /// Gets the transaction ID as a ReadOnlySpan of bytes.
+        /// Creates a checkpoint entry with the specified checkpoint ID and built-in corruption detection.
         /// </summary>
-        /// <returns>A ReadOnlySpan representing the transaction ID (16 bytes).</returns>
-        public ReadOnlySpan<byte> GetTransactionIdSpan()
+        /// <param name="checkpointId">The unique identifier for the checkpoint.</param>
+        /// <returns>A new WalEntry instance representing a checkpoint with integrity validation.</returns>
+        /// <exception cref="ArgumentException">Thrown when checkpointId is empty.</exception>
+        public static WalEntry CreateCheckpoint(Guid checkpointId)
         {
-            return _entry.AsSpan(26, 16);
-        }
+            if (checkpointId == Guid.Empty)
+                throw new ArgumentException("Checkpoint ID cannot be empty.", nameof(checkpointId));
 
-        /// <summary>
-        /// Gets the payload and checksum combined as a ReadOnlySpan of bytes.
-        /// </summary>
-        /// <returns>A ReadOnlySpan representing the payload and checksum data.</returns>
-        public ReadOnlySpan<byte> GetDataSpan()
-        {
-            return _entry.AsSpan(34);
-        }
+            // Checkpoint format:
+            // [CHECKPOINT_MARKER] [Version:1] [16-byte checkpoint GUID] [8-byte timestamp] [4-byte magic] [4-byte CRC32]
+            // Total of 34 bytes.
+            byte[] buffer = new byte[CHECKPOINT_LENGTH];
+            int offset = 0;
 
-        /// <summary>
-        /// Copies the entire WAL entry to a destination span.
-        /// </summary>
-        /// <param name="destination">The destination span to copy to.</param>
-        /// <returns>true if the copy was successful; otherwise, false.</returns>
-        public bool TryCopyTo(Span<byte> destination)
-        {
-            return _entry.AsSpan().TryCopyTo(destination);
-        }
+            // Checkpoint marker
+            buffer[offset++] = CHECKPOINT_MARKER;
 
-        /// <summary>
-        /// Gets the size of the WAL entry in bytes.
-        /// </summary>
-        /// <returns>The total size of the entry in bytes.</returns>
-        public int Size => _entry.Length;
+            // Version bytes
+            buffer[offset++] = CHECKPOINT_VERSION;
+
+            // Checkpoint ID
+            checkpointId.TryWriteBytes(buffer.AsSpan(offset, 16));
+            offset += 16;
+
+            // Timestamp (big-endian)
+            long timestampTicks = DateTimeOffset.UtcNow.Ticks;
+            BinaryPrimitives.WriteInt64BigEndian(buffer.AsSpan(offset, 8), timestampTicks);
+            offset += 8;
+
+            // Magic number. (With Mr. Bean's voice)
+            BinaryPrimitives.WriteUInt32BigEndian(buffer.AsSpan(offset, 4), CHECKPOINT_MAGIC);
+            offset += 4;
+
+            // Checksum
+            uint crc32 = CRC32.CreateHash(buffer.AsSpan(0, 30));
+            BinaryPrimitives.WriteUInt32BigEndian(buffer.AsSpan(offset, 4), crc32);
+
+            return new WalEntry(buffer);
+        }
 
         #endregion
 
@@ -302,8 +456,32 @@ namespace Zabt.Core
         /// <returns>The value of the current instance in the specified format.</returns>
         public string ToString(string format, IFormatProvider formatProvider)
         {
-            var fmt = format?.ToUpperInvariant();
-            switch (fmt)
+            if (IsCheckpoint)
+            {
+                var fmt = format?.ToUpperInvariant();
+                switch (fmt)
+                {
+                    case "S":
+                    case "SHORT":
+                        return $"Checkpoint[{EntryId:N}]";
+                    case "L":
+                    case "LONG":
+                        return $"Checkpoint {{ CheckpointId: {EntryId}, Size: {Size} bytes }}";
+                    case "J":
+                    case "JSON":
+                        return $"{{ \"type\": \"checkpoint\", \"checkpointId\": \"{EntryId}\", \"size\": {Size} }}";
+                    case null:
+                    case "":
+                    case "G":
+                    case "GENERAL":
+                        return ToString();
+                    default:
+                        throw new FormatException($"The '{format}' format string is not supported.");
+                }
+            }
+
+            var fmt2 = format?.ToUpperInvariant();
+            switch (fmt2)
             {
                 case "S":
                 case "SHORT":
@@ -313,7 +491,7 @@ namespace Zabt.Core
                     return $"WalEntry {{ EntryId: {EntryId}, Timestamp: {Timestamp:O}, TransactionId: {TransactionId}, IsCommitted: {IsCommitted}, PayloadSize: {Payload.Length} bytes }}";
                 case "J":
                 case "JSON":
-                    return $"{{ \"entryId\": \"{EntryId}\", \"timestamp\": \"{Timestamp:O}\", \"transactionId\": \"{TransactionId}\", \"isCommitted\": {IsCommitted.ToString().ToLower()}, \"payloadSize\": {Payload.Length} }}";
+                    return $"{{ \"type\": \"entry\", \"entryId\": \"{EntryId}\", \"timestamp\": \"{Timestamp:O}\", \"transactionId\": \"{TransactionId}\", \"isCommitted\": {IsCommitted.ToString().ToLower()}, \"payloadSize\": {Payload.Length} }}";
                 case null:
                 case "":
                 case "G":
@@ -330,6 +508,9 @@ namespace Zabt.Core
         /// <returns>A string that represents the current object.</returns>
         public override string ToString()
         {
+            if (IsCheckpoint)
+                return $"Checkpoint[{EntryId:D}]";
+
             return $"WalEntry[{EntryId:D}] Tx:{TransactionId:D} @ {Timestamp:yyyy-MM-dd HH:mm:ss.fff}Z ({(IsCommitted ? "Committed" : "Uncommitted")})";
         }
 

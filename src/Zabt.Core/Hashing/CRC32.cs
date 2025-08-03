@@ -2,7 +2,7 @@ using System;
 
 namespace Zabt.Core.Hashing
 {
-    internal static class CRC32
+    public static class CRC32
     {
         public static uint CreateHash(ReadOnlySpan<byte> data)
         {
@@ -23,7 +23,11 @@ namespace Zabt.Core.Hashing
                 }
             }
 
-            return ~crc;
+            // For empty data, return initial value
+            if (data.Length == 0)
+                return 0xFFFFFFFF;
+
+            return crc ^ 0xFFFFFFFF;
         }
     }
 }

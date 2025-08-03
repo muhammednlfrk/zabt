@@ -22,11 +22,11 @@ namespace Zabt.Core
         /// <summary>
         /// The binary data of the entry stored in this byte array with the following structure:
         /// <para>
-        ///     Offset 0:     Is committed flag                   - 1 byte<br/>
-        ///     Offset 1-17:  Entry ID (GUID)                     - 16 bytes<br/>
-        ///     Offset 18-25: Timestamp ticks (big-endian format) - 8 bytes<br/>
-        ///     Offset 26-33: Transaction ID (GUID)               - 16 bytes<br/>
-        ///     Offset 34..^4: Payload (operation data)           - Variable length<br/>
+        ///     Offset 0:     Reserved byte (always 0x00)           - 1 byte<br/>
+        ///     Offset 1-16:  Entry ID (GUID)                     - 16 bytes<br/>
+        ///     Offset 17-24: Timestamp ticks (big-endian format) - 8 bytes<br/>
+        ///     Offset 25-40: Transaction ID (GUID)               - 16 bytes<br/>
+        ///     Offset 41..^4: Payload (operation data)           - Variable length<br/>
         ///     Last 4 bytes: Checksum (CRC32)                    - 4 bytes<br/>
         /// </para>
         /// <para>
@@ -73,12 +73,6 @@ namespace Zabt.Core
         public bool IsCheckpoint => _entry.Length == CHECKPOINT_LENGTH && _entry[0] == CHECKPOINT_MARKER;
 
         /// <summary>
-        /// Gets a value indicating whether the operation is committed or not.
-        /// For checkpoint entries, this will always return false.
-        /// </summary>
-        public bool IsCommitted => !IsCheckpoint && _entry[0] != 0;
-
-        /// <summary>
         /// Gets the unique identifier of the entry.
         /// For checkpoint entries, this returns the checkpoint ID.
         /// </summary>
@@ -107,9 +101,13 @@ namespace Zabt.Core
         {
             get
             {
-                // The timestamp of the checksum is also in the _entry.AsSpan(18, 8)
-                // (big-endian). If it changes, you have to update this section.
-                ulong timestampTicks = BinaryPrimitives.ReadUInt64BigEndian(_entry.AsSpan(18, 8));
+                // The timestamp is stored at offset 17-24 (big-endian)
+                ulong timestampTicks = BinaryPrimitives.ReadUInt64BigEndian(_entry.AsSpan(17, 8));
+
+                // Ensure ticks value is within valid range for DateTimeOffset
+                if (timestampTicks > (ulong)DateTimeOffset.MaxValue.Ticks)
+                    timestampTicks = (ulong)DateTimeOffset.MaxValue.Ticks;
+
                 return new DateTimeOffset((long)timestampTicks, TimeSpan.Zero);
             }
         }
@@ -125,7 +123,7 @@ namespace Zabt.Core
                 if (IsCheckpoint)
                     return Guid.Empty;
 
-                return new Guid(_entry.AsSpan(26, 16));
+                return new Guid(_entry.AsSpan(25, 16));
             }
         }
 
@@ -140,7 +138,7 @@ namespace Zabt.Core
                 if (IsCheckpoint)
                     return ReadOnlySpan<byte>.Empty;
 
-                return _entry.AsSpan(34, _entry.Length - 38);
+                return _entry.AsSpan(41, _entry.Length - 45);
             }
         }
 
@@ -184,7 +182,9 @@ namespace Zabt.Core
         /// <returns>A new byte array containing a copy of the complete WAL entry data.</returns>
         public byte[] ToArray()
         {
-            return _entry;
+            byte[] result = new byte[_entry.Length];
+            _entry.CopyTo(result, 0);
+            return result;
         }
 
         /// <summary>
@@ -264,7 +264,6 @@ namespace Zabt.Core
         /// <summary>
         /// Creates a new WAL (Write-Ahead Log) entry with a CRC32 checksum for data integrity verification.
         /// </summary>
-        /// <param name="isCommitted">Indicates whether the entry represents a committed transaction.</param>
         /// <param name="entryId">The unique identifier for this WAL entry. Cannot be empty.</param>
         /// <param name="timestampTicks">The timestamp in ticks when the entry was created, stored as big-endian.</param>
         /// <param name="transactionId">The unique identifier for the transaction this entry belongs to. Cannot be empty.</param>
@@ -275,7 +274,7 @@ namespace Zabt.Core
         /// <exception cref="InvalidOperationException">Thrown when writing GUID bytes to the buffer fails.</exception>
         /// <remarks>
         /// The entry is serialized into a binary format with the following structure:
-        /// - Byte 0: IsCommitted flag (0x00 or 0x01)
+        /// - Byte 0: Reserved byte (always 0x00)
         /// - Bytes 1-16: EntryId (16 bytes)
         /// - Bytes 17-24: TimestampTicks (8 bytes, big-endian)
         /// - Bytes 25-40: TransactionId (16 bytes)
@@ -283,7 +282,6 @@ namespace Zabt.Core
         /// - Last 4 bytes: CRC32 checksum (big-endian)
         /// </remarks>
         public static WalEntry CreateEntryWithCRC32Checksum(
-            bool isCommitted,
             Guid entryId,
             long timestampTicks,
             Guid transactionId,
@@ -301,24 +299,24 @@ namespace Zabt.Core
             byte[] buffer = new byte[45 + payload.Length];
             int offset = 0;
 
-            // IsCommitted (1 byte at offset 0)
-            buffer[offset++] = (byte)(isCommitted ? 0x01 : 0x00);
+            // Reserved byte (1 byte at offset 0) - always 0x00
+            buffer[offset++] = 0x00;
 
             // EntryId (16 bytes at offset 1-17)
             bool success = entryId.TryWriteBytes(buffer.AsSpan(offset, 16));
             if (!success) throw new InvalidOperationException("Failed to write entry ID bytes to the buffer.");
             offset += 16;
 
-            // TimestampTicks (8 bytes at offset 18-25, stored as big-endian)
+            // TimestampTicks (8 bytes at offset 17-24, stored as big-endian)
             BinaryPrimitives.WriteUInt64BigEndian(buffer.AsSpan(offset, 8), (ulong)timestampTicks);
             offset += 8;
 
-            // TransactionId (16 bytes at offset 26-33)
+            // TransactionId (16 bytes at offset 25-40)
             success = transactionId.TryWriteBytes(buffer.AsSpan(offset, 16));
             if (!success) throw new InvalidOperationException("Failed to write transaction ID bytes to the buffer.");
             offset += 16;
 
-            // Payload (variable length at offset 34 to end-4)
+            // Payload (variable length at offset 41 to end-4)
             payload.AsSpan().CopyTo(buffer.AsSpan(offset, payload.Length));
             offset += payload.Length;
 
@@ -458,7 +456,7 @@ namespace Zabt.Core
         {
             if (IsCheckpoint)
             {
-                var fmt = format?.ToUpperInvariant();
+                string? fmt = format?.ToUpperInvariant();
                 switch (fmt)
                 {
                     case "S":
@@ -480,7 +478,7 @@ namespace Zabt.Core
                 }
             }
 
-            var fmt2 = format?.ToUpperInvariant();
+            string? fmt2 = format?.ToUpperInvariant();
             switch (fmt2)
             {
                 case "S":
@@ -488,10 +486,10 @@ namespace Zabt.Core
                     return $"Entry[{EntryId:N}] @ {Timestamp:yyyy-MM-dd HH:mm:ss}Z";
                 case "L":
                 case "LONG":
-                    return $"WalEntry {{ EntryId: {EntryId}, Timestamp: {Timestamp:O}, TransactionId: {TransactionId}, IsCommitted: {IsCommitted}, PayloadSize: {Payload.Length} bytes }}";
+                    return $"WalEntry {{ EntryId: {EntryId}, Timestamp: {Timestamp:O}, TransactionId: {TransactionId}, PayloadSize: {Payload.Length} bytes }}";
                 case "J":
                 case "JSON":
-                    return $"{{ \"type\": \"entry\", \"entryId\": \"{EntryId}\", \"timestamp\": \"{Timestamp:O}\", \"transactionId\": \"{TransactionId}\", \"isCommitted\": {IsCommitted.ToString().ToLower()}, \"payloadSize\": {Payload.Length} }}";
+                    return $"{{ \"type\": \"entry\", \"entryId\": \"{EntryId}\", \"timestamp\": \"{Timestamp:O}\", \"transactionId\": \"{TransactionId}\", \"payloadSize\": {Payload.Length} }}";
                 case null:
                 case "":
                 case "G":
@@ -511,7 +509,7 @@ namespace Zabt.Core
             if (IsCheckpoint)
                 return $"Checkpoint[{EntryId:D}]";
 
-            return $"WalEntry[{EntryId:D}] Tx:{TransactionId:D} @ {Timestamp:yyyy-MM-dd HH:mm:ss.fff}Z ({(IsCommitted ? "Committed" : "Uncommitted")})";
+            return $"WalEntry[{EntryId:D}] Tx:{TransactionId:D} @ {Timestamp:yyyy-MM-dd HH:mm:ss.fff}Z";
         }
 
         #endregion
